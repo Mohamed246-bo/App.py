@@ -1,0 +1,241 @@
+import os
+import json
+import time
+import threading
+import pandas as pd
+import requests
+import joblib
+
+from flask import Flask, render_template_string
+from binance.client import Client
+import ta
+from sklearn.ensemble import RandomForestClassifier
+
+# ================= CONFIG =================
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+interval = Client.KLINE_INTERVAL_15MINUTE
+
+client = Client(API_KEY, API_SECRET)
+
+MODEL_FILE = "model.pkl"
+SIGNALS_FILE = "signals.json"
+
+app = Flask(__name__)
+
+open_positions = {}
+
+# ================= TELEGRAM =================
+def send_telegram(msg):
+    if TELEGRAM_TOKEN and CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+
+# ================= DATA =================
+def get_data(symbol):
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=200)
+
+    df = pd.DataFrame(klines, columns=[
+        'time','open','high','low','close','volume',
+        'close_time','qav','trades','tbbav','tbqav','ignore'
+    ])
+
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+
+    return df
+
+# ================= AI TRAIN =================
+def train_model():
+    print("Training AI model...")
+    df = get_data("BTCUSDT")
+
+    df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
+    macd = ta.trend.MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['ma50'] = df['close'].rolling(50).mean()
+
+    df['future'] = df['close'].shift(-1)
+    df['target'] = (df['future'] > df['close']).astype(int)
+
+    df = df.dropna()
+
+    X = df[['rsi','macd','ma50','volume']]
+    y = df['target']
+
+    model = RandomForestClassifier()
+    model.fit(X, y)
+
+    joblib.dump(model, MODEL_FILE)
+    print("AI model ready ✅")
+
+# ================= LOAD MODEL =================
+if not os.path.exists(MODEL_FILE):
+    train_model()
+
+model = joblib.load(MODEL_FILE)
+
+# ================= INDICATORS =================
+def apply_indicators(df):
+    df['ma50'] = df['close'].rolling(50).mean()
+    df['ma200'] = df['close'].rolling(200).mean()
+    df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
+
+    macd = ta.trend.MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+
+    df['volume_avg'] = df['volume'].rolling(20).mean()
+
+    return df
+
+# ================= AI PREDICT =================
+def ai_predict(df):
+    last = df.iloc[-1]
+
+    features = [[
+        last['rsi'],
+        last['macd'],
+        last['ma50'],
+        last['volume']
+    ]]
+
+    pred = model.predict(features)[0]
+    prob = model.predict_proba(features)[0][1]
+
+    return pred, prob
+
+# ================= BREAKOUT =================
+def breakout(df):
+    recent_high = df['high'].rolling(20).max().iloc[-2]
+    return df['close'].iloc[-1] > recent_high
+
+# ================= SAVE SIGNAL =================
+def save_signal(symbol, entry, confidence):
+    data = []
+    if os.path.exists(SIGNALS_FILE):
+        with open(SIGNALS_FILE) as f:
+            data = json.load(f)
+
+    data.append({
+        "symbol": symbol,
+        "entry": round(entry, 2),
+        "confidence": round(confidence, 2)
+    })
+
+    with open(SIGNALS_FILE, "w") as f:
+        json.dump(data, f)
+
+# ================= TRADE =================
+def place_trade(symbol, entry):
+    try:
+        balance = client.get_asset_balance(asset='USDT')
+        usdt = float(balance['free'])
+
+        qty = round((usdt * 0.1) / entry, 5)
+
+        order = client.order_market_buy(symbol=symbol, quantity=qty)
+        return order
+    except Exception as e:
+        print("Trade error:", e)
+        return None
+
+# ================= SIGNAL =================
+def check_signal(df, symbol):
+    last = df.iloc[-1]
+
+    trend = last['ma50'] > last['ma200']
+    rsi_ok = last['rsi'] < 70
+    macd_ok = last['macd'] > last['macd_signal']
+    volume_ok = last['volume'] > last['volume_avg']
+    breakout_ok = breakout(df)
+
+    ai_signal, confidence = ai_predict(df)
+
+    if trend and rsi_ok and macd_ok and volume_ok and breakout_ok:
+        if ai_signal == 1 and confidence > 0.6:
+
+            if symbol in open_positions:
+                return
+
+            entry = last['close']
+            sl = entry * 0.97
+            tp = entry * 1.08
+
+            order = place_trade(symbol, entry)
+
+            if order:
+                open_positions[symbol] = {
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": tp
+                }
+
+                msg = f"🚀 BUY {symbol}\nEntry:{entry:.2f}\nConfidence:{confidence:.2f}"
+                print(msg)
+                send_telegram(msg)
+                save_signal(symbol, entry, confidence)
+
+# ================= MONITOR =================
+def monitor():
+    for symbol in list(open_positions.keys()):
+        df = get_data(symbol)
+        price = df['close'].iloc[-1]
+
+        pos = open_positions[symbol]
+
+        if price <= pos['sl'] or price >= pos['tp']:
+            try:
+                client.order_market_sell(symbol=symbol, quantity=0.001)
+                send_telegram(f"Closed {symbol}")
+            except:
+                pass
+
+            del open_positions[symbol]
+
+# ================= BOT LOOP =================
+def run_bot():
+    while True:
+        print("Scanning...")
+
+        for symbol in symbols:
+            try:
+                df = get_data(symbol)
+                df = apply_indicators(df)
+                check_signal(df, symbol)
+            except Exception as e:
+                print("Error:", e)
+
+        monitor()
+        time.sleep(60)
+
+# ================= DASHBOARD =================
+@app.route("/")
+def home():
+    signals = []
+    if os.path.exists(SIGNALS_FILE):
+        with open(SIGNALS_FILE) as f:
+            signals = json.load(f)
+
+    html = """
+    <h1>🚀 AI Trading Dashboard</h1>
+    {% for s in signals %}
+        <div style="border:1px solid #ccc;margin:10px;padding:10px;">
+            <h3>{{s.symbol}}</h3>
+            <p>Entry: {{s.entry}}</p>
+            <p>Confidence: {{s.confidence}}</p>
+        </div>
+    {% endfor %}
+    """
+    return render_template_string(html, signals=signals)
+
+# ================= START =================
+if __name__ == "__main__":
+    threading.Thread(target=run_bot).start()
+    app.run(host="0.0.0.0", port=10000)
